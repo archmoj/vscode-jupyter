@@ -5,11 +5,13 @@
 
 import { inject, injectable, named } from 'inversify';
 import { env, Event, EventEmitter, UIKind } from 'vscode';
-import { IApplicationShell } from '../common/application/types';
+import { IApplicationEnvironment, IApplicationShell } from '../common/application/types';
+import { Experiments } from '../common/experiments/groups';
 import '../common/extensions';
 import {
     BANNER_NAME_DS_SURVEY,
     IBrowserService,
+    IExperimentService,
     IJupyterExtensionBanner,
     IPersistentStateFactory
 } from '../common/types';
@@ -21,7 +23,9 @@ import { IInteractiveWindowListener, INotebookEditorProvider } from './types';
 export enum DSSurveyStateKeys {
     ShowBanner = 'ShowDSSurveyBanner',
     OpenNotebookCount = 'DS_OpenNotebookCount',
-    ExecutionCount = 'DS_ExecutionCount'
+    ExecutionCount = 'DS_ExecutionCount',
+    InsidersNativeNotebooksSessionCount = 'DS_NativeSessionCount',
+    LastSurveyClickDateInMilliseconds = 'DS_LastSurveyClickDateInMilliseconds'
 }
 
 enum DSSurveyLabelIndex {
@@ -73,7 +77,6 @@ export class DataScienceSurveyBannerLogger implements IInteractiveWindowListener
 @injectable()
 export class DataScienceSurveyBanner implements IJupyterExtensionBanner {
     private disabledInCurrentSession: boolean = false;
-    private isInitialized: boolean = false;
     private bannerMessage: string = localize.DataScienceSurveyBanner.bannerMessage();
     private bannerLabels: string[] = [
         localize.DataScienceSurveyBanner.bannerLabelYes(),
@@ -86,47 +89,37 @@ export class DataScienceSurveyBanner implements IJupyterExtensionBanner {
         @inject(IPersistentStateFactory) private persistentState: IPersistentStateFactory,
         @inject(IBrowserService) private browserService: IBrowserService,
         @inject(INotebookEditorProvider) editorProvider: INotebookEditorProvider,
-        surveyLink: string = 'https://aka.ms/pyaisurvey'
+        @inject(IExperimentService) private experimentService: IExperimentService,
+        @inject(IApplicationEnvironment) private applicationEnvironment: IApplicationEnvironment,
+        surveyLink: string = 'https://aka.ms/vscjupyternb'
     ) {
         this.surveyLink = surveyLink;
-        this.initialize();
+        this.incrementInsidersNativeNotebooksSessionCount().ignoreErrors();
         editorProvider.onDidOpenNotebookEditor(this.openedNotebook.bind(this));
     }
 
-    public initialize(): void {
-        if (this.isInitialized) {
-            return;
-        }
-        this.isInitialized = true;
-    }
-    public get enabled(): boolean {
-        return (
-            this.persistentState.createGlobalPersistentState<boolean>(DSSurveyStateKeys.ShowBanner, true).value &&
-            env.uiKind !== UIKind?.Web
-        );
+    private get isCodespaces(): boolean {
+        return env.uiKind === UIKind?.Web;
     }
 
     public async showBanner(): Promise<void> {
-        if (!this.enabled || this.disabledInCurrentSession) {
-            return;
-        }
-
         const executionCount: number = this.getExecutionCount();
         const notebookCount: number = this.getOpenNotebookCount();
-        const show = await this.shouldShowBanner(executionCount, notebookCount);
+        const insidersNativeNotebooksSessionCount = await this.getInsidersNativeNotebooksSessionCount();
+        const show = await this.shouldShowBanner(executionCount, notebookCount, insidersNativeNotebooksSessionCount);
         if (!show) {
             return;
         }
 
         const response = await this.appShell.showInformationMessage(this.bannerMessage, ...this.bannerLabels);
+        await this.resetElapsedNativeSessionCount();
         switch (response) {
             case this.bannerLabels[DSSurveyLabelIndex.Yes]: {
                 await this.launchSurvey();
-                await this.disable();
+                await this.updateLastSurveyClickDate();
                 break;
             }
             case this.bannerLabels[DSSurveyLabelIndex.No]: {
-                await this.disable();
                 break;
             }
             default: {
@@ -136,18 +129,26 @@ export class DataScienceSurveyBanner implements IJupyterExtensionBanner {
         }
     }
 
-    public async shouldShowBanner(executionCount: number, notebookOpenCount: number): Promise<boolean> {
-        if (!this.enabled || this.disabledInCurrentSession) {
+    public async shouldShowBanner(
+        executionCount: number,
+        notebookOpenCount: number,
+        insidersNativeNotebooksSessionCount: number
+    ): Promise<boolean> {
+        if (this.isCodespaces || this.disabledInCurrentSession || (await this.didClickSurveyLessThanTwoMonthsAgo())) {
             return false;
         }
 
-        return executionCount >= NotebookExecutionThreshold || notebookOpenCount > NotebookOpenThreshold;
+        return (
+            executionCount >= NotebookExecutionThreshold ||
+            notebookOpenCount > NotebookOpenThreshold ||
+            insidersNativeNotebooksSessionCount >= 10
+        );
     }
 
-    public async disable(): Promise<void> {
+    public async resetElapsedNativeSessionCount(): Promise<void> {
         await this.persistentState
-            .createGlobalPersistentState<boolean>(DSSurveyStateKeys.ShowBanner, false)
-            .updateValue(false);
+            .createGlobalPersistentState<number>(DSSurveyStateKeys.InsidersNativeNotebooksSessionCount, 0)
+            .updateValue(0);
     }
 
     public async launchSurvey(): Promise<void> {
@@ -162,6 +163,43 @@ export class DataScienceSurveyBanner implements IJupyterExtensionBanner {
     private getExecutionCount(): number {
         const state = this.persistentState.createGlobalPersistentState<number>(DSSurveyStateKeys.ExecutionCount, 0);
         return state.value;
+    }
+
+    private async getInsidersNativeNotebooksSessionCount(): Promise<number> {
+        const state = this.persistentState.createGlobalPersistentState<number>(
+            DSSurveyStateKeys.InsidersNativeNotebooksSessionCount,
+            0
+        );
+        return state.value;
+    }
+
+    private async incrementInsidersNativeNotebooksSessionCount() {
+        const state = this.persistentState.createGlobalPersistentState<number>(
+            DSSurveyStateKeys.InsidersNativeNotebooksSessionCount,
+            0
+        );
+        if (
+            (await this.experimentService.inExperiment(Experiments.NativeNotebook)) &&
+            this.applicationEnvironment.channel === 'insiders'
+        ) {
+            await state.updateValue(state.value + 1);
+        }
+    }
+
+    private async updateLastSurveyClickDate() {
+        await this.persistentState
+            .createGlobalPersistentState<number>(DSSurveyStateKeys.LastSurveyClickDateInMilliseconds)
+            .updateValue(Date.now());
+    }
+
+    private async didClickSurveyLessThanTwoMonthsAgo() {
+        const now = Date.now();
+        const lastClickedDate = this.persistentState.createGlobalPersistentState<number>(
+            DSSurveyStateKeys.LastSurveyClickDateInMilliseconds,
+            now
+        ).value;
+        const twoMonthsInMilliseconds = 2 * 31 * 24 * 60 * 60 * 1000;
+        return now - lastClickedDate < twoMonthsInMilliseconds;
     }
 
     private async openedNotebook() {

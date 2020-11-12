@@ -319,7 +319,6 @@ export interface IBrowserService {
 
 export const IJupyterExtensionBanner = Symbol('IJupyterExtensionBanner');
 export interface IJupyterExtensionBanner {
-    readonly enabled: boolean;
     showBanner(): Promise<void>;
 }
 export const BANNER_NAME_DS_SURVEY: string = 'DSSurveyBanner';
